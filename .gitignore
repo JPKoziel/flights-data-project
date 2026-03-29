@@ -212,3 +212,10 @@ venv/
 *.csv
 *.parquet
 *.db
+data/raw/*
+data/cleaned/*
+data/gold/*
+venv/
+*.csv
+*.parquet
+*.db
