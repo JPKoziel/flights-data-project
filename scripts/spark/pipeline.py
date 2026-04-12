@@ -6,14 +6,19 @@ Supports both full batch load and incremental (idempotent) mode.
 Usage:
     python pipeline.py              # runs full pipeline (bronze+silver+gold)
     python pipeline.py silver gold  # runs only selected layers
+    
+Idempotency strategy:
+    Each layer uses TRUNCATE + INSERT instead of DROP + CREATE.
+    This preserves table schema and indexes while replacing data safely.
 """
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, FloatType
 import logging
 import sys
 import os
+import psycopg2
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -25,6 +30,15 @@ DB_PROPS = {
     "user":     "admin",
     "password": "admin123",
     "driver":   "org.postgresql.Driver",
+    "truncate": "true",   # TRUNCATE instead of DROP+CREATE
+}
+
+PG_CONN = {
+    "host":     "localhost",
+    "port":     5432,
+    "database": "flights_db",
+    "user":     "admin",
+    "password": "admin123",
 }
 
 RAW_CSV = os.path.join(os.path.dirname(__file__), "../../data/raw/flights_sample_3m.csv")
@@ -49,26 +63,51 @@ def get_spark() -> SparkSession:
     )
 
 
+def pg_execute(sql: str) -> None:
+    """Execute a SQL statement directly via psycopg2 (DDL, TRUNCATE etc.)."""
+    conn = psycopg2.connect(**PG_CONN)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.close()
+
+
+def write_idempotent(df: DataFrame, schema: str, table: str) -> None:
+    """
+    Write DataFrame to PostgreSQL using TRUNCATE + INSERT (idempotent).
+    Creates table on first run, truncates on subsequent runs.
+    Never drops the table - preserves schema and indexes.
+    """
+    full_table = f"{schema}.{table}"
+    df.write.jdbc(
+        url=DB_URL,
+        table=full_table,
+        mode="overwrite",
+        properties=DB_PROPS,   # truncate=true tells JDBC to TRUNCATE not DROP
+    )
+
+
 # ── Bronze ─────────────────────────────────────────────────────────────────────
 def load_bronze(spark: SparkSession) -> None:
-    """Load raw CSV 1:1 into bronze.flights (idempotent overwrite)."""
+    """Load raw CSV 1:1 into bronze.flights (idempotent TRUNCATE + INSERT)."""
+    log.info("BRONZE – ensuring schema exists …")
+    pg_execute("CREATE SCHEMA IF NOT EXISTS bronze;")
+
     log.info("BRONZE – reading CSV …")
     df = spark.read.csv(RAW_CSV, header=True, inferSchema=False)
     log.info(f"BRONZE – {df.count():,} rows read from CSV")
 
-    log.info("BRONZE – writing to PostgreSQL …")
-    df.write.jdbc(
-        url=DB_URL,
-        table="bronze.flights",
-        mode="overwrite",
-        properties=DB_PROPS,
-    )
+    log.info("BRONZE – writing to PostgreSQL (TRUNCATE + INSERT) …")
+    write_idempotent(df, "bronze", "flights")
     log.info("BRONZE – done ✅")
 
 
 # ── Silver ─────────────────────────────────────────────────────────────────────
 def load_silver(spark: SparkSession) -> None:
-    """Clean CSV data directly and write to silver.flights (idempotent overwrite)."""
+    """Clean CSV data and write to silver.flights (idempotent TRUNCATE + INSERT)."""
+    log.info("SILVER – ensuring schema exists …")
+    pg_execute("CREATE SCHEMA IF NOT EXISTS silver;")
+
     log.info("SILVER – reading directly from CSV …")
     df = spark.read.csv(RAW_CSV, header=True, inferSchema=False)
 
@@ -112,19 +151,17 @@ def load_silver(spark: SparkSession) -> None:
         )
     )
 
-    log.info("SILVER – writing to PostgreSQL …")
-    df_clean.write.jdbc(
-        url=DB_URL,
-        table="silver.flights",
-        mode="overwrite",
-        properties=DB_PROPS,
-    )
+    log.info("SILVER – writing to PostgreSQL (TRUNCATE + INSERT) …")
+    write_idempotent(df_clean, "silver", "flights")
     log.info("SILVER – done ✅")
 
 
 # ── Gold ───────────────────────────────────────────────────────────────────────
 def load_gold(spark: SparkSession) -> None:
-    """Aggregate directly from CSV into gold.airline_route_stats (idempotent overwrite)."""
+    """Aggregate CSV data into gold.airline_route_stats (idempotent TRUNCATE + INSERT)."""
+    log.info("GOLD – ensuring schema exists …")
+    pg_execute("CREATE SCHEMA IF NOT EXISTS gold;")
+
     log.info("GOLD – reading directly from CSV …")
     df = spark.read.csv(RAW_CSV, header=True, inferSchema=False)
 
@@ -161,13 +198,8 @@ def load_gold(spark: SparkSession) -> None:
         )
     )
 
-    log.info("GOLD – writing to PostgreSQL …")
-    df_gold.write.jdbc(
-        url=DB_URL,
-        table="gold.airline_route_stats",
-        mode="overwrite",
-        properties=DB_PROPS,
-    )
+    log.info("GOLD – writing to PostgreSQL (TRUNCATE + INSERT) …")
+    write_idempotent(df_gold, "gold", "airline_route_stats")
     log.info("GOLD – done ✅")
 
 
