@@ -227,3 +227,4 @@ venv/
 *.parquet
 *.db
 jars/
+.DS_Store
