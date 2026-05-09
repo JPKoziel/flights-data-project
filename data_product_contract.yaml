@@ -1,0 +1,209 @@
+# ============================================
+# Data Product Contract
+# US Flight Delays — Medallion Pipeline
+# ============================================
+
+product:
+  name: US Flight Delays Analytics
+  version: "1.0"
+  owner: Jan Kozieł
+  contact: github.com/JPKoziel
+  created: "2024-01-01"
+  updated: "2024-04-13"
+
+purpose: >
+  Analytical dataset providing aggregated statistics on US domestic flight
+  delays and cancellations (2019–2023). Enables analysis of airline and
+  route performance, delay causes, and cancellation patterns.
+
+source:
+  name: Kaggle — Flight Delay and Cancellation Dataset 2019-2023
+  url: https://www.kaggle.com/datasets/patrickzel/flight-delay-and-cancellation-dataset-2019-2023
+  format: CSV
+  size: 614 MB
+  rows: 3_000_000
+  coverage: "2019-01-01 to 2023-08-31"
+
+architecture:
+  type: Medallion (Bronze → Silver → Gold)
+  layers:
+    bronze:
+      table: bronze.flights
+      description: Raw data loaded 1:1 from CSV, all columns as TEXT
+      rows: 3_000_000
+      columns: 31
+      size: 725 MB
+    silver:
+      table: silver.flights
+      description: Cleaned data with correct types, NaN removed, duplicates dropped
+      rows: 3_000_000
+      columns: 25
+      size: 494 MB
+    gold:
+      table: gold.airline_route_stats
+      description: Aggregated route statistics grouped by airline and route
+      rows: 14_777
+      size: 2.4 MB
+
+schema:
+  gold_layer:
+    - name: airline
+      type: TEXT
+      description: Full airline name
+    - name: airline_code
+      type: TEXT
+      description: IATA airline code (e.g. UA, DL, AA)
+    - name: origin
+      type: TEXT
+      description: Origin airport IATA code
+    - name: origin_city
+      type: TEXT
+      description: Origin city and state
+    - name: dest
+      type: TEXT
+      description: Destination airport IATA code
+    - name: dest_city
+      type: TEXT
+      description: Destination city and state
+    - name: total_flights
+      type: BIGINT
+      description: Total number of flights on this route
+    - name: avg_dep_delay_min
+      type: NUMERIC
+      description: Average departure delay in minutes (NULL = on time or cancelled)
+    - name: avg_arr_delay_min
+      type: NUMERIC
+      description: Average arrival delay in minutes (NULL = on time or cancelled)
+    - name: avg_distance_miles
+      type: NUMERIC
+      description: Average flight distance in miles
+    - name: avg_carrier_delay
+      type: NUMERIC
+      description: Average delay caused by the carrier in minutes
+    - name: avg_weather_delay
+      type: NUMERIC
+      description: Average delay caused by weather in minutes
+    - name: avg_nas_delay
+      type: NUMERIC
+      description: Average delay caused by National Air System in minutes
+    - name: avg_late_aircraft_delay
+      type: NUMERIC
+      description: Average delay caused by late arriving aircraft in minutes
+    - name: total_cancelled
+      type: NUMERIC
+      description: Total number of cancelled flights on this route
+    - name: cancellation_rate_pct
+      type: NUMERIC
+      description: Percentage of cancelled flights (0-100)
+    - name: first_flight_date
+      type: DATE
+      description: Earliest flight date in the dataset for this route
+    - name: last_flight_date
+      type: DATE
+      description: Latest flight date in the dataset for this route
+
+refresh:
+  frequency: daily
+  schedule: "0 6 * * *"
+  orchestrator: Apache Airflow
+  pipeline: flights_medallion_pipeline
+  idempotent: true
+  strategy: TRUNCATE + INSERT
+
+access:
+  database: PostgreSQL 15
+  host: localhost
+  port: 5432
+  database_name: flights_db
+  user: admin
+  note: >
+    Database runs locally via Docker. To access, clone the repository
+    and follow setup instructions in README.md.
+
+quality_metrics:
+  - name: completeness_arr_delay
+    definition: "% of rows where arr_delay is not NULL"
+    current_value: "97.13%"
+    threshold: "> 95%"
+    status: PASS
+    cadence: every pipeline run
+
+  - name: completeness_airline
+    definition: "% of rows where airline is not NULL"
+    current_value: "100.00%"
+    threshold: "= 100%"
+    status: PASS
+    cadence: every pipeline run
+
+  - name: uniqueness_flight_records
+    definition: "% of unique (fl_date, airline_code, origin, dest, fl_number)"
+    current_value: "100.00%"
+    threshold: "= 100%"
+    status: PASS
+    cadence: every pipeline run
+
+  - name: row_count
+    definition: Total number of records in silver.flights
+    current_value: 3_000_000
+    threshold: "> 2_900_000"
+    status: PASS
+    cadence: every pipeline run
+
+  - name: validity_arr_delay
+    definition: "% of arr_delay values between -120 and 1440 minutes"
+    current_value: "100.00%"
+    threshold: "> 99%"
+    status: PASS
+    cadence: every pipeline run
+
+  - name: data_freshness
+    definition: Most recent flight date in the dataset
+    current_value: "2023-08-31"
+    threshold: static dataset
+    status: INFO
+    cadence: daily
+
+known_limitations:
+  - Dataset covers 2019-2023 only — not a live feed
+  - 2.87% of arr_delay values are NULL (cancelled/diverted flights)
+  - Routes with fewer than 10 flights are excluded from gold layer
+  - Data is loaded from a Kaggle sample (3M rows), not the full BTS dataset
+  - NaN values in numeric columns were converted to NULL during silver transformation
+
+example_usage:
+  sql: |
+    -- Top 10 routes with highest average arrival delay
+    SELECT
+      airline,
+      origin,
+      dest,
+      total_flights,
+      avg_arr_delay_min,
+      cancellation_rate_pct
+    FROM gold.airline_route_stats
+    WHERE total_flights >= 100
+    ORDER BY avg_arr_delay_min DESC
+    LIMIT 10;
+
+  python: |
+    import psycopg2
+    import pandas as pd
+
+    conn = psycopg2.connect(
+        host="localhost", port=5432,
+        database="flights_db",
+        user="admin", password="admin123"
+    )
+
+    df = pd.read_sql("""
+        SELECT airline, origin, dest,
+               avg_arr_delay_min, cancellation_rate_pct
+        FROM gold.airline_route_stats
+        WHERE total_flights >= 100
+        ORDER BY avg_arr_delay_min DESC
+        LIMIT 10
+    """, conn)
+
+    print(df)
+
+repository: https://github.com/JPKoziel/flights-data-project
